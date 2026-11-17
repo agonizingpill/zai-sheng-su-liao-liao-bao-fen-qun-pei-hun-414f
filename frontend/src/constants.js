@@ -1,6 +1,6 @@
 export const ROLES={admin:'投料主管',blender:'配混员',viewer:'质检观察员'};
 export const BLEND_STATES={draft:'待称料',ready:'审秤通过',released:'已投料'};
-export const AUDIT_ACTIONS={bale_received:'来料登记',bale_retested:'料包复检',blend_created:'配方立单',weighed:'称料保存',checked:'审秤通过',blend_reopened:'退回秤台',released:'主管投料放行'};
+export const AUDIT_ACTIONS={bale_received:'来料登记',bale_retested:'料包复检',blend_created:'配方立单',weighed:'称料保存',checked:'审秤通过',blend_reopened:'退回秤台',released:'主管投料放行',reserved:'确认整单预留',reserve_retry:'重试确认(同方案不重复占料)',reservation_released:'释放整单预留'};
 
 export const LOT_STATES={active:'来料可用',quarantine:'整批隔离'};
 export const PELLET_STATES={quarantine:'PVC越限隔离',passed:'检验合格待签证',certified:'主管已发合格证'};

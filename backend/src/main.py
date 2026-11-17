@@ -2,14 +2,16 @@ import os,hmac,logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI,Depends,HTTPException
 from fastapi.responses import JSONResponse
-from sqlalchemy import select,text
+from sqlalchemy import select,text,func
 from sqlalchemy.exc import IntegrityError
 from redis import Redis
 from .database import Base,engine,Session
 from .models import User,Bale,Blend,BlendPortion,Audit
+from .reservation_models import BlendReservation
 from .schemas import Login,BaleIn,BlendIn,PortionsIn
 from .security import current,allow,password_hash,token_for
-from .blending import obj,get,audit,view,set_portions,evaluate,release
+from .blending import obj,get,audit,view,set_portions,evaluate,release,reserve,unreserve,reopen
+from .planner import recommend as recommend_plan
 from .middlewares import RequestTrace,Recovery
 from scripts.seed_demo import seed
 import json
@@ -37,11 +39,23 @@ def health():
 def login(d:Login):
     with Session() as s:
         u=s.scalar(select(User).where(User.email==d.email))
-        if not u or not hmac.compare_digest(u.password,password_hash(d.password)):raise HTTPException(401,'账号或密码不正确')
+        if not u or not hmac.compare_digest(u.password,password_hash(d.password)):raise HTTPException(401,'账号或口令不正确')
         return {'token':token_for(u),'email':u.email,'role':u.role}
+def bale_views(s):
+    from .blending import held_elsewhere
+    all_ids=list(s.scalars(select(Bale.id)))
+    held=held_elsewhere(s,all_ids,None) if all_ids else {}
+    reserved_rows={bid:total for bid,total in s.execute(select(BlendReservation.bale_id,func.coalesce(func.sum(BlendReservation.kg),0)).group_by(BlendReservation.bale_id)).all()}
+    out=[]
+    for x in s.scalars(select(Bale).order_by(Bale.id)):
+        d=obj(x);reserved=reserved_rows.get(x.id,0)
+        d['reserved_kg']=float(reserved)  # 整单预留在堆场余量中的占用
+        d['margin_kg']=float(x.available_kg-held.get(x.id,0))  # 扣除预留与其他单称料后的可称余量
+        out.append(d)
+    return out
 @app.get('/bales')
 def bales(u=Depends(current)):
-    with Session() as s:return [obj(x) for x in s.scalars(select(Bale).order_by(Bale.id))]
+    with Session() as s:return bale_views(s)
 @app.post('/bales')
 def add_bale(d:BaleIn,u=Depends(current)):
     allow(u,'admin','blender')
@@ -53,6 +67,7 @@ def edit_bale(id:int,d:BaleIn,u=Depends(current)):
     with Session.begin() as s:
         b=get(s,Bale,id,True)
         if s.scalar(select(BlendPortion.id).where(BlendPortion.bale_id==id).limit(1)):raise HTTPException(409,'料包已被配方引用，质量与原始重量快照冻结')
+        if s.scalar(select(BlendReservation.id).where(BlendReservation.bale_id==id).limit(1)):raise HTTPException(409,'料包存在整单预留，质量与原始重量冻结')
         for k,v in d.model_dump().items():setattr(b,k,v)
         b.available_kg=d.kg;b.cluster_id=None;b.cluster_version=None;audit(s,u,'bale_retested',b.code);return obj(b)
 @app.get('/clusters')
@@ -76,17 +91,26 @@ def create_blend(d:BlendIn,u=Depends(current)):
 def weigh(id:int,d:PortionsIn,u=Depends(current)):
     allow(u,'admin','blender')
     with Session.begin() as s:return set_portions(s,get(s,Blend,id,True),d,u)
+@app.get('/blends/{id}/recommend')
+def recommend(id:int,u=Depends(current)):
+    # 纯读推荐：不写库、不占料；页面据此核对推荐依据后再确认整单预留
+    with Session() as s:return recommend_plan(s,get(s,Blend,id))
+@app.post('/blends/{id}/reserve')
+def reserve_blend(id:int,d:PortionsIn,u=Depends(current)):
+    allow(u,'admin','blender')
+    with Session.begin() as s:return reserve(s,get(s,Blend,id,True),d,u)
+@app.post('/blends/{id}/unreserve')
+def unreserve_blend(id:int,u=Depends(current)):
+    allow(u,'admin','blender')
+    with Session.begin() as s:return unreserve(s,get(s,Blend,id,True),u)
 @app.post('/blends/{id}/check')
 def check(id:int,u=Depends(current)):
     allow(u,'admin','blender')
     with Session.begin() as s:return evaluate(s,get(s,Blend,id,True),u)
 @app.post('/blends/{id}/reopen')
-def reopen(id:int,u=Depends(current)):
+def reopen_blend(id:int,u=Depends(current)):
     allow(u,'admin','blender')
-    with Session.begin() as s:
-        b=get(s,Blend,id,True)
-        if b.status!='ready':raise HTTPException(409,'仅待放行配方可退回，已放行配方不可改动')
-        b.status='draft';b.weighted_pvc=None;audit(s,u,'blend_reopened',b.code);return view(s,b)
+    with Session.begin() as s:return reopen(s,get(s,Blend,id,True),u)
 @app.post('/blends/{id}/release')
 def release_blend(id:int,u=Depends(current)):
     allow(u,'admin')
